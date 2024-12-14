@@ -1,14 +1,14 @@
 import pygame
 import math
+from scipy.spatial import ConvexHull
 
 pygame.init()
 
-font = pygame.font.SysFont(None,36)
+font = pygame.font.SysFont(None, 36)
 
 # 화면 설정
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("2D Physics Simulation with Circular Obstacles")
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
@@ -20,21 +20,19 @@ GRAY = (100, 100, 100)
 FPS = 60
 points = []
 polygon = None
-friction = 0.99
+friction = 0
 restitution = 0.8  # 탄성계수
 initial_force = [0.0, 0.0]
 page = "shape_creation"
 input_buffer = ""
 input_target = None
 dragging = False
-# obstacles를 딕셔너리로 변경: {'x':, 'y':, 'r':, 'vx':, 'vy':}
 obstacles = []
 inside_polygon_drag = False
 force_application_point = None
 drag_start = None
 
 def calculate_polygon_area(points):
-    """Shoelace Formula를 사용하여 다각형의 넓이를 계산"""
     n = len(points)
     area = 0
     for i in range(n):
@@ -68,21 +66,35 @@ def line_intersect_circle(p1, p2, c, r):
     fy = y1 - cy
 
     a = dx*dx + dy*dy
+    if a < 1e-8:
+        # p1과 p2가 같은 점인 경우
+        distance = math.hypot(x1 - cx, y1 - cy)
+        if distance <= r:
+            # 원 내부에 있으므로 충돌 발생
+            return p1
+        else:
+            # 충돌 없음
+            return None
+
     b = 2*(fx*dx + fy*dy)
     c_ = fx*fx + fy*fy - r*r
 
     discriminant = b*b - 4*a*c_
     if discriminant < 0:
+        # 교차점 없음
         return None
     else:
         discriminant = math.sqrt(discriminant)
         t1 = (-b + discriminant) / (2*a)
         t2 = (-b - discriminant) / (2*a)
 
+        # 선분 내의 유효한 t 값 찾기
         ts = [t for t in [t1, t2] if 0 <= t <= 1]
-        if len(ts) == 0:
+        if not ts:
+            # 교차점이 선분 내에 없음
             return None
 
+        # 가장 가까운 교차점 선택
         t_min = min(ts)
         ix = x1 + t_min*dx
         iy = y1 + t_min*dy
@@ -102,15 +114,110 @@ def reflect_velocity(velocity, normal):
     vy_new *= restitution
     return (vx_new, vy_new)
 
+def calculate_polygon_inertia(points, area):
+    n = len(points)
+    inertia = 0.0
+    for i in range(n):
+        x0, y0 = points[i]
+        x1, y1 = points[(i + 1) % n]
+        cross = x0 * y1 - x1 * y0
+        inertia += cross * (x0**2 + x0*x1 + x1**2 + y0**2 + y0*y1 + y1**2)
+    return abs(inertia) / 12.0 / area
+
+def is_convex(prev, current, next_):
+    (px, py) = prev
+    (cx, cy) = current
+    (nx, ny) = next_
+    cross = (cx - px) * (ny - py) - (cy - py) * (nx - px)
+    return cross < 0
+
+def point_in_triangle(pt, v1, v2, v3):
+    """Check if a point is inside a triangle."""
+    def sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - \
+               (p2[0] - p3[0]) * (p1[1] - p3[1])
+    
+    b1 = sign(pt, v1, v2) < 0.0
+    b2 = sign(pt, v2, v3) < 0.0
+    b3 = sign(pt, v3, v1) < 0.0
+
+    return ((b1 == b2) and (b2 == b3))
+
+def ear_clipping_triangulation(polygon_points):
+    if len(polygon_points) < 3:
+        return []
+
+    vertices = polygon_points.copy()
+    if calculate_polygon_area(vertices) < 0:
+        vertices = vertices[::-1]
+
+    triangles = []
+    while len(vertices) > 3:
+        ear_found = False
+        n = len(vertices)
+        for i in range(n):
+            prev = vertices[i - 1]
+            current = vertices[i]
+            next_ = vertices[(i + 1) % n]
+
+            if is_convex(prev, current, next_):
+                ear = True
+                for j in range(n):
+                    if j in [(i - 1) % n, i, (i + 1) % n]:
+                        continue
+                    if point_in_triangle(vertices[j], prev, current, next_):
+                        ear = False
+                        break
+                if ear:
+                    triangles.append([prev, current, next_])
+                    del vertices[i]
+                    ear_found = True
+                    break
+        if not ear_found:
+            break
+    if len(vertices) == 3:
+        triangles.append(vertices)
+    return triangles
+
+def triangle_circle_collision(triangle, circle_center, radius):
+    for i in range(3):
+        p1 = triangle[i]
+        p2 = triangle[(i + 1) % 3]
+        intersect = line_intersect_circle(p1, p2, circle_center, radius)
+        if intersect:
+            ix, iy = intersect
+            nx = ix - circle_center[0]
+            ny = iy - circle_center[1]
+            length = math.hypot(nx, ny)
+            if length == 0:
+                continue 
+            nx /= length
+            ny /= length
+            return (ix, iy), (nx, ny)
+    if point_in_polygon(circle_center, triangle):
+        cx, cy = circle_center
+        tx, ty = triangle[0]
+        nx = cx - tx
+        ny = cy - ty
+        length = math.hypot(nx, ny)
+        if length == 0:
+            return None
+        nx /= length
+        ny /= length
+        return (cx, cy), (nx, ny)
+    return None
+
 class Polygon:
     def __init__(self, points, velocity, angular_velocity, friction):
+        self.original_points = points.copy()
         self.points = points
         self.velocity = velocity
         self.angular_velocity = angular_velocity
         self.friction = friction
         self.center = self.calculate_center()
-        self.area = calculate_polygon_area(points)  # 다각형의 넓이
-        self.inertia = self.area * 0.5  # 관성 모멘트 (넓이에 비례)
+        self.area = calculate_polygon_area(points)
+        self.inertia = calculate_polygon_inertia(points, self.area)
+        self.triangles = ear_clipping_triangulation(self.points)
 
     def calculate_center(self):
         x_coords = [p[0] for p in self.points]
@@ -121,6 +228,7 @@ class Polygon:
         self.velocity = (self.velocity[0] * self.friction, self.velocity[1] * self.friction)
         self.points = [(x + self.velocity[0], y + self.velocity[1]) for x, y in self.points]
         self.center = self.calculate_center()
+        self.triangles = ear_clipping_triangulation(self.points)
 
     def rotate(self):
         angle = self.angular_velocity
@@ -134,87 +242,104 @@ class Polygon:
             )
             for x, y in self.points
         ]
+        self.triangles = ear_clipping_triangulation(self.points)
 
     def handle_collision(self, obstacles):
-        # 화면 경계 충돌
         for (x, y) in self.points:
             if x <= 0:
                 normal = (1, 0)
                 self.velocity = reflect_velocity(self.velocity, normal)
                 self.angular_velocity *= -0.5
-                self.points = [(px+1, py) for (px, py) in self.points]
+                self.points = [(px + 1, py) for (px, py) in self.points]
                 self.center = self.calculate_center()
+                self.triangles = ear_clipping_triangulation(self.points)
                 break
             if x >= WIDTH:
                 normal = (-1, 0)
                 self.velocity = reflect_velocity(self.velocity, normal)
                 self.angular_velocity *= -0.5
-                self.points = [(px-1, py) for (px, py) in self.points]
+                self.points = [(px - 1, py) for (px, py) in self.points]
                 self.center = self.calculate_center()
+                self.triangles = ear_clipping_triangulation(self.points)
                 break
             if y <= 0:
                 normal = (0, 1)
                 self.velocity = reflect_velocity(self.velocity, normal)
                 self.angular_velocity *= -0.5
-                self.points = [(px, py+1) for (px, py) in self.points]
+                self.points = [(px, py + 1) for (px, py) in self.points]
                 self.center = self.calculate_center()
+                self.triangles = ear_clipping_triangulation(self.points)
                 break
             if y >= HEIGHT:
                 normal = (0, -1)
                 self.velocity = reflect_velocity(self.velocity, normal)
                 self.angular_velocity *= -0.5
-                self.points = [(px, py-1) for (px, py) in self.points]
+                self.points = [(px, py - 1) for (px, py) in self.points]
                 self.center = self.calculate_center()
+                self.triangles = ear_clipping_triangulation(self.points)
                 break
 
-        # 원형 장애물 충돌
-        poly_edges = polygon_edges(self.points)
+        # 원형 장애물과의 충돌 감지 및 응답
         for obstacle in obstacles:
             ox, oy, r = obstacle['x'], obstacle['y'], obstacle['r']
-            intersection_found = False
-            for pe in poly_edges:
-                p1, p2 = pe
-                ip = line_intersect_circle(p1, p2, (ox, oy), r)
-                if ip:
-                    # 충돌 처리
-                    nx = ip[0] - ox
-                    ny = ip[1] - oy
-                    length = math.sqrt(nx*nx + ny*ny)
-                    if length > 0:
-                        nx /= length
-                        ny /= length
-                    else:
-                        nx, ny = 0, 0
+            for triangle in self.triangles:
+                collision_info = triangle_circle_collision(triangle, (ox, oy), r)
+                if collision_info:
+                    ip, normal = collision_info
+                    self.resolve_collision(normal, obstacle)
+                    break 
 
-                    # 임펄스 계산 및 속도 반영
-                    relative_velocity = (
-                        self.velocity[0] - obstacle['vx'],
-                        self.velocity[1] - obstacle['vy']
-                    )
-                    impulse_magnitude = -(1 + restitution) * (relative_velocity[0] * nx + relative_velocity[1] * ny)
-                    impulse_magnitude /= (1 / 1.0 + 1 / 1.0)  # 질량 = 1 가정
+    def resolve_collision(self, normal, obstacle):
+        relative_velocity = (
+            self.velocity[0] - obstacle['vx'],
+            self.velocity[1] - obstacle['vy']
+        )
 
-                    Jx = impulse_magnitude * nx
-                    Jy = impulse_magnitude * ny
+        rel_vel_dot_n = relative_velocity[0] * normal[0] + relative_velocity[1] * normal[1]
 
-                    self.velocity = (
-                        self.velocity[0] + Jx,
-                        self.velocity[1] + Jy
-                    )
-                    obstacle['vx'] -= Jx
-                    obstacle['vy'] -= Jy
+        if rel_vel_dot_n > 0:
+            return  # 서로 멀어지고 있으므로 충돌 처리하지 않음
 
-                    # 각속도 업데이트
-                    r_vector = (ip[0] - self.center[0], ip[1] - self.center[1])
-                    torque = r_vector[0] * Jy - r_vector[1] * Jx
-                    self.angular_velocity += torque / self.inertia  # 넓이 기반 관성 모멘트 사용
-                    intersection_found = True
-                    break
-            if intersection_found:
-                break
+        # 임펄스 크기 계산
+        impulse_mag = -(1 + restitution) * rel_vel_dot_n
+        impulse_mag /= (1 / 1.0 + 1 / 1.0)  # 질량 = 1 가정
+
+        # 임펄스 벡터 계산
+        Jx = impulse_mag * normal[0]
+        Jy = impulse_mag * normal[1]
+
+        # 폴리곤의 속도 업데이트
+        self.velocity = (
+            self.velocity[0] + Jx / 1.0,
+            self.velocity[1] + Jy / 1.0
+        )
+
+        # 장애물의 속도 업데이트 (반대 방향으로)
+        obstacle['vx'] -= Jx / 1.0
+        obstacle['vy'] -= Jy / 1.0
+
+        # 충돌 지점에서 각속도 업데이트
+        # 충돌 지점과 다각형 중심 간의 벡터를 계산
+        collision_point = (
+            obstacle['x'] - normal[0] * obstacle['r'],
+            obstacle['y'] - normal[1] * obstacle['r']
+        )
+        cx, cy = self.center
+        rx = collision_point[0] - cx
+        ry = collision_point[1] - cy
+
+        # 충격량(momentum)에 따라 각속도를 업데이트
+        torque = rx * (Jy) - ry * (Jx)
+        self.angular_velocity += torque / self.inertia
+
+        # 충돌 후 각속도 약간 감소
+        self.angular_velocity *= restitution
 
     def draw(self, screen):
+        # 폴리곤 그리기
         pygame.draw.polygon(screen, RED, self.points, 0)
+        for triangle in self.triangles:
+            pygame.draw.polygon(screen, GREEN, triangle, 1)
 
     def apply_force_at_point(self, point, force):
         cx, cy = self.center
@@ -225,11 +350,8 @@ class Polygon:
         fx, fy = force
         self.velocity = (self.velocity[0] + fx, self.velocity[1] + fy)
 
-
         torque = rx * fy - ry * fx 
-        self.angular_velocity += torque / self.inertia
-
-
+        self.angular_velocity += 10*torque / self.inertia
 
 def handle_obstacle_collisions(obstacles, restitution):
     for i in range(len(obstacles)):
@@ -241,29 +363,33 @@ def handle_obstacle_collisions(obstacles, restitution):
             distance = math.hypot(dx, dy)
             min_dist = obs1['r'] + obs2['r']
             if distance < min_dist and distance != 0:
-                # Normal vector
+                # 노말 벡터 계산
                 nx = dx / distance
                 ny = dy / distance
 
-                # Relative velocity
+                # 상대 속도 계산
                 dvx = obs1['vx'] - obs2['vx']
                 dvy = obs1['vy'] - obs2['vy']
                 rel_vel = dvx * nx + dvy * ny
 
                 if rel_vel > 0:
-                    continue  # They are moving away from each other
+                    continue  
 
-                # Impulse scalar
+                # 임펄스 크기 계산
                 impulse = -(1 + restitution) * rel_vel
-                impulse /= (1 / 1.0 + 1 / 1.0)  # Assuming mass = 1 for both
+                impulse /= (1 / 1.0 + 1 / 1.0)  # 질량 = 1 가정
 
-                # Apply impulse to the velocities
-                obs1['vx'] += (impulse * nx) / 1.0
-                obs1['vy'] += (impulse * ny) / 1.0
-                obs2['vx'] -= (impulse * nx) / 1.0
-                obs2['vy'] -= (impulse * ny) / 1.0
+                # 임펄스 벡터 계산
+                Jx = impulse * nx
+                Jy = impulse * ny
 
-                # Position correction to prevent sticking
+                # 장애물의 속도 업데이트
+                obs1['vx'] += Jx / 1.0
+                obs1['vy'] += Jy / 1.0
+                obs2['vx'] -= Jx / 1.0
+                obs2['vy'] -= Jy / 1.0
+
+                # 위치 보정 (붙는 현상 방지)
                 overlap = min_dist - distance
                 correction = overlap / 2
                 obs1['x'] -= correction * nx
@@ -298,20 +424,20 @@ while running:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN and input_target is None:
                     page = "simulation"
-                    polygon = Polygon(points, velocity=initial_force, angular_velocity=0.05, friction=friction)
+                    polygon = Polygon(points, velocity=initial_force, angular_velocity=0.05, friction=1-friction)
                 elif event.key == pygame.K_BACKSPACE:
                     input_buffer = input_buffer[:-1]
                 elif event.key == pygame.K_RETURN and input_target:
                     try:
                         value = float(input_buffer)
                         if input_target == "friction":
-                            friction = max(0.5, min(1.0, value))
+                            friction = value
                         elif input_target == "force_x":
                             initial_force[0] = value
                         elif input_target == "force_y":
                             initial_force[1] = value
                         elif input_target == "restitution":
-                            restitution = max(0.0, min(1.0, value))
+                            restitution = value
                     except ValueError:
                         pass
                     input_buffer = ""
@@ -378,7 +504,7 @@ while running:
         screen.blit(font.render(msg, True, BLACK), (10, 10))
 
     elif page == "settings":
-        screen.blit(font.render(f"Friction: {1-friction:.2f}", True, BLACK), (50, 50))
+        screen.blit(font.render(f"Friction: {friction:.2f}", True, BLACK), (50, 50))
         screen.blit(font.render(f"Force X: {initial_force[0]:.2f}", True, BLACK), (50, 100))
         screen.blit(font.render(f"Force Y: {initial_force[1]:.2f}", True, BLACK), (50, 150))
         screen.blit(font.render(f"Restitution: {restitution:.2f}", True, BLACK), (50, 200))
@@ -390,7 +516,7 @@ while running:
             screen.blit(font.render(msg, True, BLACK), (50, 250))
 
     elif page == "simulation":
-        # 폴리곤 업데이트
+        # 폴리곤 업데이트 및 그리기
         if polygon:
             polygon.move()
             polygon.rotate()
@@ -400,30 +526,30 @@ while running:
         # 장애물 업데이트 (움직이게)
         for obs in obstacles:
             # 마찰 적용
-            obs['vx'] *= friction
-            obs['vy'] *= friction
+            obs['vx'] *= 1-friction
+            obs['vy'] *= 1-friction
             # 위치 업데이트
             obs['x'] += obs['vx']
             obs['y'] += obs['vy']
 
-            # 화면 경계 처리(간단 반사)
-            if obs['x']-obs['r'] < 0:
+            # 화면 경계 처리 (간단 반사)
+            if obs['x'] - obs['r'] < 0:
                 obs['x'] = obs['r']
                 obs['vx'] = -obs['vx'] * restitution
-            if obs['x']+obs['r'] > WIDTH:
-                obs['x'] = WIDTH-obs['r']
+            if obs['x'] + obs['r'] > WIDTH:
+                obs['x'] = WIDTH - obs['r']
                 obs['vx'] = -obs['vx'] * restitution
-            if obs['y']-obs['r'] < 0:
+            if obs['y'] - obs['r'] < 0:
                 obs['y'] = obs['r']
                 obs['vy'] = -obs['vy'] * restitution
-            if obs['y']+obs['r'] > HEIGHT:
-                obs['y'] = HEIGHT-obs['r']
+            if obs['y'] + obs['r'] > HEIGHT:
+                obs['y'] = HEIGHT - obs['r']
                 obs['vy'] = -obs['vy'] * restitution
 
-        # Handle obstacle-obstacle collisions
+        # 장애물 간의 충돌 처리
         obstacles = handle_obstacle_collisions(obstacles, restitution)
 
-        # Draw obstacles
+        # 장애물 그리기
         for obs in obstacles:
             pygame.draw.circle(screen, GRAY, (int(obs['x']), int(obs['y'])), obs['r'])  # 내부 채우기
             pygame.draw.circle(screen, BLACK, (int(obs['x']), int(obs['y'])), obs['r'], 2)  # 테두리
